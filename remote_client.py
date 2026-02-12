@@ -10,7 +10,7 @@ from typing import Any, Optional
 import httpx
 from httpx_sse import aconnect_sse
 
-REMOTE_SERVER_URL = "https://eshipz-mcp.onrender.com/sse"
+REMOTE_SERVER_URL = "https://eshipz-mcp.onrender.com"
 
 
 class RemoteMCPClient:

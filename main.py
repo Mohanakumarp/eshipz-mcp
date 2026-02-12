@@ -701,7 +701,8 @@ if __name__ == "__main__":
     
     # Check if running with SSE transport (for remote server)
     if "--sse" in sys.argv or os.getenv("USE_SSE", "false").lower() == "true":
-        mcp.run(transport='sse')
+        port = int(os.getenv("PORT", 10000))
+        mcp.run(transport='sse', port=port, host='0.0.0.0')
     else:
         # Default to stdio for local use
         mcp.run(transport='stdio')
