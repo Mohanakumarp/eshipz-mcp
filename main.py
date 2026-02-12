@@ -701,10 +701,16 @@ if __name__ == "__main__":
     import uvicorn
 
     if "--sse" in sys.argv or os.getenv("USE_SSE", "false").lower() == "true":
-        # FastMCP reads HOST and PORT from environment
-        os.environ.setdefault("HOST", "0.0.0.0")
-        if not os.getenv("PORT"):
-            os.environ["PORT"] = "10000"
-        mcp.run(transport="sse")
+        # Get port from Render environment
+        port = int(os.getenv("PORT", 10000))
+        
+        # Create MCP SSE app and run with uvicorn
+        app = mcp._create_sse_app()
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=port,
+            log_level="info"
+        )
     else:
         mcp.run(transport="stdio")
