@@ -701,8 +701,10 @@ if __name__ == "__main__":
     
     # Check if running with SSE transport (for remote server)
     if "--sse" in sys.argv or os.getenv("USE_SSE", "false").lower() == "true":
-        port = int(os.getenv("PORT", 10000))
-        mcp.run(transport='sse', port=port, host='0.0.0.0')
+        # FastMCP SSE transport uses PORT and HOST env variables
+        os.environ.setdefault("PORT", os.getenv("PORT", "10000"))
+        os.environ.setdefault("HOST", "0.0.0.0")
+        mcp.run(transport='sse')
     else:
         # Default to stdio for local use
         mcp.run(transport='stdio')
