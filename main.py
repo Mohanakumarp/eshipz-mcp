@@ -18,11 +18,12 @@ API_BASE_URL = os.getenv("API_BASE_URL", "https://app.eshipz.com")
 ESHIPZ_API_TRACKING_URL = f"{API_BASE_URL}/api/v2/trackings"
 ESHIPZ_TOKEN = os.getenv("ESHIPZ_TOKEN", "")
 ESHIPZ_CARRIER_PERFORMANCE_URL = "https://ds.eshipz.com/performance_score/cps_scores/v2/"
-ESHIPZ_API_CREATE_SHIPMENT_URL = f"{API_BASE_URL}/api/v1/create-shipments"
+ESHIPZ_API_CREATE_SHIPMENT_URL = f"{API_BASE_URL}/api/v1/create-shipments/rule-based"
 ESHIPZ_API_DOCKET_ALLOCATION_URL = f"{API_BASE_URL}/api/v1/docket-allocation"
 ESHIPZ_API_ORDERS_URL = "https://orders.eshipz.com/api/v1/orders"
 
 # Map common natural language descriptions to exact eShipz API slugs
+'''
 CARRIER_SLUG_MAP = {
     "bluedart": "bluedart",
     "blue dart": "bluedart",
@@ -250,7 +251,7 @@ def normalize_date(date_str: str) -> str | None:
         except ValueError:
             continue
     return None
-
+'''
 async def get_tracking_details(tracking_number: str) -> dict[str, Any] | None:
     headers = {
         "Content-Type": "application/json",
@@ -667,7 +668,7 @@ def _format_docket_allocation_response(data: dict) -> str:
         return summary
     
     return str(data)
-
+'''
 async def lookup_pincode(pincode: str) -> dict[str, Any] | None:
     """
     Look up city, state, district from a 6-digit Indian pincode using India Post API.
@@ -707,7 +708,7 @@ async def lookup_pincode(pincode: str) -> dict[str, Any] | None:
             print(f"Pincode lookup failed for {pincode}: {str(e)}")
     
     return None
-
+'''
 @mcp.tool()
 async def get_tracking(tracking_number: str) -> str:
     
@@ -841,173 +842,42 @@ async def create_shipment(
     invoice_number: str = "",
     invoice_date: str = "",
     is_document: bool = False,
-    vendor_id: str = "",
     ship_from_gstin: str = "",
     item_hsn_code: str = "",
     item_sku: str = ""
 ) -> str:
     
-    # Determine actual slug from natural language description
-    actual_carrier_slug = _get_slug_from_description(carrier_description)
-
-    # Validate required fields
-    REQUIRED_FIELDS = {
-        "ship_from_name": ship_from_name,
-        "ship_from_pincode": ship_from_pincode,
-        "ship_from_phone": ship_from_phone,
-        "ship_to_name": ship_to_name,
-        "ship_to_pincode": ship_to_pincode,
-        "ship_to_phone": ship_to_phone,
-        "parcel_weight_kg": parcel_weight_kg,
-    }
+    # Use carrier_description directly or default to "auto" for rule-based routing
+    actual_carrier_slug = carrier_description.lower().strip() if carrier_description else "auto"
     
-    missing = [k for k, v in REQUIRED_FIELDS.items() if not v]
-    if missing:
-        return f"Missing required fields: {', '.join(missing)}"
-
-    # Validate phone numbers - use as-is if provided, only normalize if invalid
-    # Try to use phone as provided first
-    phone_digits_from = re.sub(r"\D", "", ship_from_phone)
-    if len(phone_digits_from) >= 10:
-        # User provided valid-looking phone, use it as-is
-        ship_from_phone = phone_digits_from[-10:]  # Take last 10 digits
-    else:
-        # Fallback: try normalize function
-        normalized = normalize_phone(ship_from_phone)
-        if not normalized:
-            return f"Invalid shipper phone number: {ship_from_phone}. Must be a valid Indian mobile number (10 digits)."
-        ship_from_phone = normalized
-
-    phone_digits_to = re.sub(r"\D", "", ship_to_phone)
-    if len(phone_digits_to) >= 10:
-        # User provided valid-looking phone, use it as-is
-        ship_to_phone = phone_digits_to[-10:]  # Take last 10 digits
-    else:
-        # Fallback: try normalize function
-        normalized = normalize_phone(ship_to_phone)
-        if not normalized:
-            return f"Invalid consignee phone number: {ship_to_phone}. Must be a valid Indian mobile number (10 digits)."
-        ship_to_phone = normalized
-
-    # Validate pincodes - accept if user provided valid 6-digit format
-    if not (ship_from_pincode and len(ship_from_pincode) == 6 and ship_from_pincode.isdigit()):
-        return f"Invalid shipper pincode: {ship_from_pincode}. Must be a valid 6-digit Indian pincode."
+    if ship_from_phone:
+        phone_digits_from = re.sub(r"\D", "", ship_from_phone)
+        if len(phone_digits_from) >= 10:
+            ship_from_phone = phone_digits_from[-10:]  # Take last 10 digits
+        # If less than 10 digits, pass as-is
     
-    if not (ship_to_pincode and len(ship_to_pincode) == 6 and ship_to_pincode.isdigit()):
-        return f"Invalid consignee pincode: {ship_to_pincode}. Must be a valid 6-digit Indian pincode."
+    if ship_to_phone:
+        phone_digits_to = re.sub(r"\D", "", ship_to_phone)
+        if len(phone_digits_to) >= 10:
+            ship_to_phone = phone_digits_to[-10:]  # Take last 10 digits
+        # If less than 10 digits, pass as-is
+    chargeable_weight = parcel_weight_kg
 
-    # Validate parcel dimensions - only apply rules if user provided dimensions
-    if parcel_length_cm > 0 or parcel_width_cm > 0 or parcel_height_cm > 0:
-        # User provided dimensions, validate them
-        dimension_error = validate_parcel_dimensions(parcel_weight_kg, parcel_length_cm, parcel_width_cm, parcel_height_cm)
-        if dimension_error:
-            return dimension_error
-    elif parcel_weight_kg > MAX_WEIGHT_KG:
-        # User didn't provide dimensions but weight is invalid
-        return f"Parcel weight {parcel_weight_kg}kg exceeds max allowed ({MAX_WEIGHT_KG}kg)."
+    # Simple address type logic - based on company name presence only
+    ship_from_type = "business" if ship_from_company else "residential"
+    ship_to_type = "business" if ship_to_company else "residential"
 
-    # Validate COD settings
-    if is_cod and cod_amount <= 0:
-        return "COD amount must be greater than 0 when COD is enabled."
-
-    if not is_cod and cod_amount > 0:
-        cod_amount = 0.0  # silently fix inconsistency
-
-    # Compute chargeable weight - use actual weight if dimensions not provided
-    if parcel_length_cm > 0 and parcel_width_cm > 0 and parcel_height_cm > 0:
-        # User provided full dimensions, compute volumetric vs actual
-        chargeable_weight = compute_chargeable_weight(parcel_weight_kg, parcel_length_cm, parcel_width_cm, parcel_height_cm)
-    else:
-        # User didn't provide full dimensions, use actual weight
-        chargeable_weight = parcel_weight_kg
-
-    # Infer service type if not provided
-    if not service_type:
-        service_type = infer_service_type(parcel_weight_kg, actual_carrier_slug)
-
-    # Normalize invoice date if provided
-    if invoice_date:
-        normalized_date = normalize_date(invoice_date)
-        if not normalized_date:
-            return f"Invalid invoice date format: {invoice_date}. Accepted formats: DD-MM-YYYY, DD/MM/YYYY, YYYY/MM/DD, DD MMM YYYY"
-        invoice_date = normalized_date
-
-    # If pincode provided but city/state missing, try pincode lookup
-    if ship_from_pincode and (not ship_from_city or not ship_from_state):
-        try:
-            info = await lookup_pincode(ship_from_pincode)
-            if info:
-                ship_from_city = ship_from_city or info.get("city", ship_from_city)
-                ship_from_state = ship_from_state or info.get("state", ship_from_state)
-        except Exception:
-            pass
-
-    if ship_to_pincode and (not ship_to_city or not ship_to_state):
-        try:
-            info = await lookup_pincode(ship_to_pincode)
-            if info:
-                ship_to_city = ship_to_city or info.get("city", ship_to_city)
-                ship_to_state = ship_to_state or info.get("state", ship_to_state)
-        except Exception:
-            pass
-
-    # If city provided but state missing, try to infer using local mapping
-    missing_states = []
-
-    if ship_from_city and not ship_from_state:
-        inferred = infer_state_from_city(ship_from_city)
-        if inferred:
-            ship_from_state = inferred
-        else:
-            missing_states.append(f"sender (city: {ship_from_city})")
-
-    if ship_to_city and not ship_to_state:
-        inferred = infer_state_from_city(ship_to_city)
-        if inferred:
-            ship_to_state = inferred
-        else:
-            missing_states.append(f"consignee (city: {ship_to_city})")
-
-    # If any states are missing and couldn't be inferred, ask the user
-    if missing_states:
-        if len(missing_states) == 1:
-            return f"Please provide the state for the {missing_states[0]}."
-        else:
-            return f"Please provide the states for: {', '.join(missing_states)}."
-
-    # Infer address types - use rules as backup if company/street are not clear
-    # But default to the basic logic if company name exists
-    if not ship_from_company and not ship_from_street1:
-        ship_from_type = "residential"  # No company info, default to residential
-    else:
-        ship_from_type = infer_address_type(ship_from_company, ship_from_street1)
-    
-    if not ship_to_company and not ship_to_street1:
-        ship_to_type = "residential"  # No company info, default to residential
-    else:
-        ship_to_type = infer_address_type(ship_to_company, ship_to_street1)
-
-    # Build shipment data structure
+    # Build shipment data structure with only required fields
     shipment_data = {
-        "billing": {
-            "paid_by": "shipper"
-        },
-        "slug": actual_carrier_slug,
-        "service_type": service_type or None,
-        "customer_reference": customer_reference,
-        "purpose": "commercial",  #standard value-commercial
-        "order_source": "mcp_api",
+        "description": parcel_description,
+        "purpose": "commercial",
+        "order_source": "manual",
         "parcel_contents": parcel_description,
         "is_document": is_document,
+        "customer_reference": customer_reference,
+        "invoice_number": invoice_number,
+        "invoice_date": invoice_date,
         "is_cod": is_cod,
-        "collect_on_delivery": {
-            "amount": cod_amount if is_cod else 0,
-            "currency": "INR"
-        },
-        "charged_weight": {
-            "unit": "kg",
-            "value": chargeable_weight
-        },
         "shipment": {
             "ship_from": {
                 "contact_name": ship_from_name,
@@ -1017,10 +887,11 @@ async def create_shipment(
                 "city": ship_from_city,
                 "state": ship_from_state,
                 "postal_code": ship_from_pincode,
+                "country": "IN",
+                "type": ship_from_type,
                 "phone": ship_from_phone,
                 "email": ship_from_email,
-                "country": "IN",
-                "type": ship_from_type
+                "tax_id": ship_from_gstin
             },
             "ship_to": {
                 "contact_name": ship_to_name,
@@ -1030,10 +901,11 @@ async def create_shipment(
                 "city": ship_to_city,
                 "state": ship_to_state,
                 "postal_code": ship_to_pincode,
+                "country": "IN",
+                "type": ship_to_type,
                 "phone": ship_to_phone,
                 "email": ship_to_email if ship_to_email else ship_from_email,
-                "country": "IN",
-                "type": ship_to_type
+                "tax_id": ""
             },
             "return_to": {
                 "contact_name": ship_from_name,
@@ -1043,10 +915,11 @@ async def create_shipment(
                 "city": ship_from_city,
                 "state": ship_from_state,
                 "postal_code": ship_from_pincode,
+                "country": "IN",
+                "type": ship_from_type,
                 "phone": ship_from_phone,
                 "email": ship_from_email,
-                "country": "IN",
-                "type": ship_from_type
+                "tax_id": ship_from_gstin
             },
             "is_reverse": False,
             "is_to_pay": False,
@@ -1068,12 +941,8 @@ async def create_shipment(
                     "items": [
                         {
                             "description": item_description,
-                            "origin_country": "IN",
                             "quantity": item_quantity,
-                            "weight": {
-                                "value": parcel_weight_kg,
-                                "unit": "kg"
-                            }
+                            "price": item_price
                         }
                     ]
                 }
@@ -1081,20 +950,6 @@ async def create_shipment(
         },
         "gst_invoices": []
     }
-    
-    # Add optional fields
-    if vendor_id:
-        shipment_data["vendor_id"] = vendor_id
-    
-    if invoice_number:
-        shipment_data["invoice_number"] = invoice_number
-    
-    if invoice_date:
-        shipment_data["invoice_date"] = invoice_date
-    
-    if ship_from_gstin:
-        shipment_data["shipment"]["ship_from"]["tax_id"] = ship_from_gstin
-        shipment_data["shipment"]["return_to"]["tax_id"] = ship_from_gstin
     
     # Add GST invoice if details provided
     if invoice_number and invoice_date:
@@ -1104,8 +959,7 @@ async def create_shipment(
                 "invoice_number": invoice_number,
                 "invoice_date": invoice_date,
                 "invoice_value": total_value,
-                "ewaybill_number": "",
-                "ewaybill_date": ""
+                "ewaybill_number": ""
             }
         ]
     
@@ -1138,9 +992,7 @@ async def fetch_and_create_shipment(
     ship_from_pincode: str = "",
     ship_from_phone: str = "",
     ship_from_email: str = "",
-    ship_from_gstin: str = "",
-    # Optional fields
-    vendor_id: str = ""
+    ship_from_gstin: str = ""
 ) -> str:
     """
     Fetch an order by order_id from eShipz Orders API and create a shipment using the order data.
@@ -1156,7 +1008,6 @@ async def fetch_and_create_shipment(
         carrier_description: Natural language carrier description (e.g., "bluedart", "delhivery")
         service_type: Service type for shipment
         ship_from_*: Shipper details (required if shipper_address in order is empty)
-        vendor_id: Optional vendor ID
     
     Returns:
         Success message with shipment details or error message
@@ -1348,8 +1199,7 @@ async def fetch_and_create_shipment(
         is_cod=is_cod,
         cod_amount=cod_amount,
         invoice_number=invoice_number,
-        invoice_date=invoice_date,
-        vendor_id=vendor_id
+        invoice_date=invoice_date
     )
     
     return result
