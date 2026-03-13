@@ -898,6 +898,12 @@ async def create_shipment(
         if len(phone_digits_to) >= 10:
             ship_to_phone = phone_digits_to[-10:]  # Take last 10 digits
 
+    # Normalize key identity fields so whitespace-only values are treated as empty.
+    ship_from_company = (ship_from_company or "").strip()
+    ship_to_company = (ship_to_company or "").strip()
+    ship_from_name = (ship_from_name or "").strip()
+    ship_to_name = (ship_to_name or "").strip()
+
     # Simple address type logic - based on company name presence
     ship_from_type = "business" if ship_from_company else "residential"
     ship_to_type = "business" if ship_to_company else "residential"
@@ -1128,32 +1134,43 @@ async def fetch_and_create_shipment(
     4. Creates a shipment by calling the create_shipment API
     
     Args:
-        order_id: The order ID to fetch (e.g., "INV/25-26/656776")
+        order_id: The order ID to fetch (e.g., "testtn10003", "INV/25-26/656776")
         carrier_description: Natural language carrier description (e.g., "bluedart", "delhivery")
         service_type: Service type for shipment
-        ship_from_*: Shipper details (required if shipper_address in order is empty)
+        ship_from_*: Shipper details (required if shipper_address in order is empty or incomplete; company is optional)
     
     Returns:
-        Success message with shipment details or error message
+        Success message with shipment details or error message with missing fields
     """
     
     # Step 1: Fetch order from Orders API
     order_data = await fetch_order_by_id(order_id)
     
     if not order_data:
-        return f"Failed to fetch order {order_id}. Please verify the order ID and try again."
+        return f"Failed to fetch order '{order_id}'. Please verify the order ID and try again."
     
     # Check if the response is successful
     if order_data.get("status") != 200:
         remark = order_data.get("remark", "Unknown error")
-        return f"Failed to fetch order {order_id}: {remark}"
+        return f"Failed to fetch order '{order_id}': {remark}"
     
     # Extract order details
     orders = order_data.get("orders", [])
     if not orders or len(orders) == 0:
-        return f"No order found with ID {order_id}"
+        return f"No order found with ID '{order_id}'"
     
     order = orders[0]
+    
+    # Check order fulfilment status. Do not fail fast here because we can still
+    # gather missing required fields and prompt the caller with exact inputs.
+    fulfilment_status = order.get("fulfilment_status", {})
+    fulfilment_warning = ""
+    if fulfilment_status.get("status") == "failure":
+        failure_msg = fulfilment_status.get("msg", "Unknown validation error")
+        fulfilment_warning = (
+            f"Order '{order_id}' has validation failures from Orders API: {failure_msg}\n\n"
+            "Proceeding with required-field checks for shipment creation.\n\n"
+        )
     
     # Step 2: Extract data from order
     receiver_address = order.get("receiver_address", {})
@@ -1166,26 +1183,30 @@ async def fetch_and_create_shipment(
     is_cod = order.get("is_cod", False)
     cod_amount = float(order.get("cod_amount", 0))
     
+    # Extract shipment value
+    shipment_value = float(order.get("shipment_value", 0))
+    
     # Extract invoice details
     invoice_number = order.get("invoice_number", "")
     invoice_date = ""
-    invoice_value = 0.0
+    invoice_value = shipment_value  # Use shipment value as invoice value
     
     if gst_invoices and len(gst_invoices) > 0:
         gst_invoice = gst_invoices[0]
         invoice_number = invoice_number or gst_invoice.get("invoice_number", "")
         invoice_date = gst_invoice.get("invoice_date", "")
-        invoice_value = gst_invoice.get("invoice_value", 0.0)
+        if gst_invoice.get("invoice_value"):
+            invoice_value = float(gst_invoice.get("invoice_value", 0))
     
     # Extract receiver (ship_to) details
     ship_to_name = f"{receiver_address.get('first_name', '')} {receiver_address.get('last_name', '')}".strip()
-    ship_to_company = receiver_address.get("company_name", "")
-    ship_to_street1 = receiver_address.get("address", "")
-    ship_to_city = receiver_address.get("city", "")
-    ship_to_state = receiver_address.get("state", "")
-    ship_to_pincode = receiver_address.get("zipcode", "")
-    ship_to_phone = receiver_address.get("phone", "")
-    ship_to_email = receiver_address.get("email", "")
+    ship_to_company = (receiver_address.get("company_name", "") or "").strip()
+    ship_to_street1 = (receiver_address.get("address", "") or "").strip()
+    ship_to_city = (receiver_address.get("city", "") or "").strip()
+    ship_to_state = (receiver_address.get("state", "") or "").strip()
+    ship_to_pincode = (receiver_address.get("zipcode", "") or "").strip()
+    ship_to_phone = (receiver_address.get("phone", "") or "").strip()
+    ship_to_email = (receiver_address.get("email", "") or "").strip()
     ship_to_gstin = receiver_address.get("gst_number", "")
     
     # Extract shipper (ship_from) details - use provided values or order values
@@ -1215,6 +1236,16 @@ async def fetch_and_create_shipment(
     
     if not ship_from_gstin and shipper_address.get("gst_number"):
         ship_from_gstin = shipper_address.get("gst_number", "")
+
+    # Normalize shipper fields after merge (tool args + order defaults).
+    ship_from_name = (ship_from_name or "").strip()
+    ship_from_company = (ship_from_company or "").strip()
+    ship_from_street1 = (ship_from_street1 or "").strip()
+    ship_from_city = (ship_from_city or "").strip()
+    ship_from_state = (ship_from_state or "").strip()
+    ship_from_pincode = (ship_from_pincode or "").strip()
+    ship_from_phone = (ship_from_phone or "").strip()
+    ship_from_email = (ship_from_email or "").strip()
     
     # Extract item details (use first item if multiple)
     item_description = ""
@@ -1263,24 +1294,66 @@ async def fetch_and_create_shipment(
     
     # Check if required fields are missing
     missing_fields = []
+    missing_shipper_fields = []
+    missing_receiver_fields = []
     
+    # Validate receiver details
     if not ship_to_name:
-        missing_fields.append("receiver name")
+        missing_receiver_fields.append("name (first_name/last_name)")
+    if not ship_to_street1:
+        missing_receiver_fields.append("address")
+    if not ship_to_city:
+        missing_receiver_fields.append("city")
+    if not ship_to_state:
+        missing_receiver_fields.append("state")
     if not ship_to_pincode:
-        missing_fields.append("receiver pincode")
+        missing_receiver_fields.append("pincode")
     if not ship_to_phone:
-        missing_fields.append("receiver phone")
-    if not ship_from_name:
-        missing_fields.append("shipper name (ship_from_name parameter)")
-    if not ship_from_pincode:
-        missing_fields.append("shipper pincode (ship_from_pincode parameter)")
-    if not ship_from_phone:
-        missing_fields.append("shipper phone (ship_from_phone parameter)")
-    if parcel_weight_kg <= 0:
-        missing_fields.append("parcel weight")
+        missing_receiver_fields.append("phone")
     
-    if missing_fields:
-        return f"Cannot create shipment. Missing required fields: {', '.join(missing_fields)}"
+    # Validate shipper details
+    if not ship_from_name:
+        missing_shipper_fields.append("name (provide ship_from_name parameter)")
+    if not ship_from_street1:
+        missing_shipper_fields.append("address (provide ship_from_street1 parameter)")
+    if not ship_from_city:
+        missing_shipper_fields.append("city (provide ship_from_city parameter)")
+    if not ship_from_state:
+        missing_shipper_fields.append("state (provide ship_from_state parameter)")
+    if not ship_from_pincode:
+        missing_shipper_fields.append("pincode (provide ship_from_pincode parameter)")
+    if not ship_from_phone:
+        missing_shipper_fields.append("phone (provide ship_from_phone parameter)")
+    
+    # Validate parcel details
+    if parcel_weight_kg <= 0:
+        missing_fields.append("parcel weight (must be greater than 0)")
+    
+    # Build error message with clear sections
+    if missing_receiver_fields or missing_shipper_fields or missing_fields:
+        error_msg = fulfilment_warning
+        error_msg += f"Cannot create shipment for order '{order_id}'. Missing required fields:\n\n"
+        
+        if missing_receiver_fields:
+            error_msg += "RECEIVER DETAILS (from order):\n"
+            for field in missing_receiver_fields:
+                error_msg += f"  - {field}\n"
+            error_msg += "\n"
+        
+        if missing_shipper_fields:
+            error_msg += "SHIPPER DETAILS (must be provided as tool parameters):\n"
+            for field in missing_shipper_fields:
+                error_msg += f"  - {field}\n"
+            error_msg += "\nExample: Use ship_from_name='John Doe', ship_from_street1='Address', etc.\n\n"
+        
+        if missing_fields:
+            error_msg += "OTHER REQUIRED FIELDS:\n"
+            for field in missing_fields:
+                error_msg += f"  - {field}\n"
+
+        error_msg += "\nPlease provide the missing fields and retry fetch_and_create_shipment."
+        
+        return error_msg
     
     # Step 3: Create shipment using the create_shipment tool
     result = await create_shipment(
