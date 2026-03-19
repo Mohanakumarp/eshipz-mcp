@@ -1231,7 +1231,7 @@ async def fetch_and_create_shipment(
     
     # Check order fulfilment status. Do not fail fast here because we can still
     # gather missing required fields and prompt the caller with exact inputs.
-    fulfilment_status = order.get("fulfilment_status", {})
+    fulfilment_status = order.get("fulfilment_status") or {}
     fulfilment_warning = ""
     if fulfilment_status.get("status") == "failure":
         failure_msg = fulfilment_status.get("msg", "Unknown validation error")
@@ -1241,11 +1241,11 @@ async def fetch_and_create_shipment(
         )
     
     # Step 2: Extract data from order
-    receiver_address = order.get("receiver_address", {})
-    shipper_address = order.get("shipper_address", {})
-    items = order.get("items", [])
-    parcels = order.get("parcels", [])
-    gst_invoices = order.get("gst_invoices", [])
+    receiver_address = order.get("receiver_address") or {}
+    shipper_address = order.get("shipper_address") or {}
+    items = order.get("items") or []
+    parcels = order.get("parcels") or []
+    gst_invoices = order.get("gst_invoices") or []
     
     # Determine COD
     is_cod = order.get("is_cod", False)
@@ -1335,7 +1335,7 @@ async def fetch_and_create_shipment(
         first_item = items[0]
         item_description = first_item.get("description", "")
         item_quantity = int(first_item.get("quantity", 1))
-        item_value = first_item.get("value", {})
+        item_value = first_item.get("value") or {}
         item_price = float(item_value.get("amount", 0))
         item_sku = first_item.get("sku", "")
         item_hsn_code = first_item.get("hs_code", "")
@@ -1349,7 +1349,7 @@ async def fetch_and_create_shipment(
     
     if parcels and len(parcels) > 0:
         first_parcel = parcels[0]
-        weight_data = first_parcel.get("weight", {})
+        weight_data = first_parcel.get("weight") or {}
         order_parcel_weight_kg = float(weight_data.get("value", 0) or 0)
         
         # Convert weight to kg if needed
@@ -1357,7 +1357,7 @@ async def fetch_and_create_shipment(
         if weight_unit == "G" or weight_unit == "GRAM":
             order_parcel_weight_kg = order_parcel_weight_kg / 1000
         
-        dimensions = first_parcel.get("dimensions", {})
+        dimensions = first_parcel.get("dimensions") or {}
         order_parcel_length_cm = float(dimensions.get("length", 0) or 0)
         order_parcel_width_cm = float(dimensions.get("width", 0) or 0)
         order_parcel_height_cm = float(dimensions.get("height", 0) or 0)
