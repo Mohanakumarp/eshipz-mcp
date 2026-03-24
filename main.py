@@ -33,13 +33,13 @@ mcp = FastMCP(
 )
 
 # Constants
-API_BASE_URL = os.getenv("API_BASE_URL", "https://app.eshipz.com")
-ESHIPZ_API_TRACKING_URL = f"{API_BASE_URL}/api/v2/trackings"
-ESHIPZ_TOKEN = os.getenv("ESHIPZ_TOKEN", "")
-ESHIPZ_CARRIER_PERFORMANCE_URL = "https://ds.eshipz.com/performance_score/cps_scores/v2/"
-ESHIPZ_API_CREATE_SHIPMENT_URL = f"{API_BASE_URL}/api/v1/create-shipments/rule-based"
-ESHIPZ_API_DOCKET_ALLOCATION_URL = f"{API_BASE_URL}/api/v1/docket-allocation"
-ESHIPZ_API_ORDERS_URL = "https://orders.eshipz.com/api/v1/orders"
+API_BASE_URL = os.getenv("API_BASE_URL")
+ESHIPZ_API_TRACKING_URL = os.getenv("ESHIPZ_API_TRACKING_URL")
+ESHIPZ_TOKEN = os.getenv("ESHIPZ_TOKEN")
+ESHIPZ_CARRIER_PERFORMANCE_URL = os.getenv("ESHIPZ_CARRIER_PERFORMANCE_URL")
+ESHIPZ_API_CREATE_SHIPMENT_URL = os.getenv("ESHIPZ_API_CREATE_SHIPMENT_URL")
+ESHIPZ_API_DOCKET_ALLOCATION_URL =os.getenv("ESHIPZ_API_DOCKET_ALLOCATION_URL")
+ESHIPZ_API_ORDERS_URL = os.getenv("ESHIPZ_API_ORDERS_URL")
 
 
 def _resolve_eshipz_token(ctx: Context | None = None) -> str:
@@ -390,7 +390,6 @@ async def fetch_order_by_id(order_id: str, api_token: str | None = None) -> dict
         "Content-Type": "application/json",
         "X-API-TOKEN": resolved_token
     }
-    # URL format: https://orders.eshipz.com/api/v1/orders/{order_id}
     url = f"{ESHIPZ_API_ORDERS_URL}/{order_id}"
     async with httpx.AsyncClient() as client:
         try:
