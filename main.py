@@ -8,7 +8,7 @@ import os
 import re
 from datetime import datetime 
 from auth import EshipzOAuthProvider
-
+from datetime import datetime, timezone, timedelta
 # Load environment variables
 load_dotenv()
 
@@ -40,6 +40,7 @@ ESHIPZ_CARRIER_PERFORMANCE_URL = os.getenv("ESHIPZ_CARRIER_PERFORMANCE_URL")
 ESHIPZ_API_CREATE_SHIPMENT_URL = os.getenv("ESHIPZ_API_CREATE_SHIPMENT_URL")
 ESHIPZ_API_DOCKET_ALLOCATION_URL =os.getenv("ESHIPZ_API_DOCKET_ALLOCATION_URL")
 ESHIPZ_API_ORDERS_URL = os.getenv("ESHIPZ_API_ORDERS_URL")
+ESHIPZ_API_GET_SHIPMENTS_URL = os.getenv("ESHIPZ_API_GET_SHIPMENTS_URL") # e.g., "https://xxxxxxxxxxxxxxx/xxx/xxx/xxxxxxxxxx"
 
 
 def _resolve_eshipz_token(ctx: Context | None = None) -> str:
@@ -1506,6 +1507,136 @@ async def fetch_and_create_shipment(
     
     return result
 
+async def fetch_shipments_page(
+    min_date: str, 
+    max_date: str, 
+    page: int, 
+    limit: int, 
+    api_token: str | None = None
+) -> list[dict]:
+    """Fetches a specific page of shipments within a date range."""
+    resolved_token = api_token or ESHIPZ_TOKEN
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-TOKEN": resolved_token
+    }
+    
+    params = {
+        "page": page,
+        "limit": limit,
+        "min_date": min_date,
+        "max_date": max_date
+    }
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                ESHIPZ_API_GET_SHIPMENTS_URL,
+                headers=headers,
+                params=params,
+                timeout=30.0
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if data and isinstance(data, list):
+                return data
+                
+        except Exception as e:
+            print(f"Error fetching shipments page {page}: {str(e)}")
+            
+    return []
+
+@mcp.tool()
+async def get_stuck_shipments(
+    days_stuck: int = 5, 
+    lookback_days: int = 30, 
+    page: int = 1,          # Added parameter for Claude
+    limit: int = 50,        # Added parameter for Claude
+    ctx: Context = None
+) -> str:
+    """
+    Finds shipments that have been stuck in transit without tracking updates.
+    Returns a specific page of results. If the number of shipments fetched equals 
+    the limit, you should call this tool again with page + 1 to get more results.
+    """
+    api_token = _resolve_eshipz_token(ctx)
+    
+    if not ESHIPZ_API_GET_SHIPMENTS_URL:
+        return "Error: ESHIPZ_API_GET_SHIPMENTS_URL is not defined in the environment variables."
+
+    now_utc = datetime.now(timezone.utc)
+    max_date_obj = now_utc
+    min_date_obj = now_utc - timedelta(days=lookback_days)
+    
+    max_date_str = max_date_obj.strftime("%Y-%m-%d")
+    min_date_str = min_date_obj.strftime("%Y-%m-%d")
+
+    # Fetch just the requested page
+    shipments = await fetch_shipments_page(min_date_str, max_date_str, page, limit, api_token)
+
+    if not shipments:
+        return f"No shipments found on page {page} between {min_date_str} and {max_date_str}."
+
+    stuck_shipments = []
+
+    for shipment in shipments:
+        status = shipment.get("tracking_status", "")
+        sub_status = shipment.get("tracking_sub_status", "")
+        
+        if status == "Delivered" or sub_status == "RTODelivered":
+            continue
+
+        date_str = shipment.get("latest_checkpoint_date")
+        if not date_str:
+            continue
+
+        try:
+            checkpoint_date = datetime.strptime(date_str, "%a, %d %b %Y %H:%M:%S GMT")
+            checkpoint_date = checkpoint_date.replace(tzinfo=timezone.utc)
+            
+            days_diff = (now_utc - checkpoint_date).days
+            
+            if days_diff > days_stuck:
+                stuck_shipments.append((shipment, days_diff))
+        except ValueError:
+            continue
+
+    stuck_shipments.sort(key=lambda x: x[1], reverse=True)
+
+    # Format the header to include page and limit info for Claude
+    summary = f"⚠️ FOUND {len(stuck_shipments)} STUCK SHIPMENTS (> {days_stuck} days without update)\n"
+    summary += f"📅 Date Range: {min_date_str} to {max_date_str}\n"
+    summary += f"📄 Page: {page} | Limit: {limit} | Fetched: {len(shipments)} items\n"
+    
+    # Give Claude a clear hint if there might be more data
+    if len(shipments) == limit:
+        summary += f"💡 Note: There are likely more shipments. Call this tool again with page={page + 1} to continue searching.\n"
+        
+    summary += f"{'-' * 60}\n\n"
+
+    if not stuck_shipments:
+        summary += f"Good news! No stuck shipments found on this specific page.\n"
+        return summary
+
+    for shipment, days in stuck_shipments:
+        awb = shipment.get("awb", "Unknown")
+        order_id = shipment.get("order_id", "Unknown")
+        carrier = shipment.get("vendor_display_name", shipment.get("slug", "Unknown"))
+        status = shipment.get("tracking_status", "Unknown")
+        sub_status = shipment.get("tracking_sub_status", "")
+        latest_date = shipment.get("latest_checkpoint_date", "Unknown")
+        
+        display_status = status
+        if sub_status:
+            display_status += f" ({sub_status})"
+
+        summary += f"📦 Order: {order_id} | AWB: {awb}\n"
+        summary += f"   Carrier: {carrier}\n"
+        summary += f"   Status: {display_status}\n"
+        summary += f"   Last Update: {latest_date} ({days} days ago)\n\n"
+
+    return summary
 
 if __name__ == "__main__":
     import sys
