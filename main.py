@@ -1548,7 +1548,7 @@ async def fetch_shipments_page(
     return []
 
 @mcp.tool()
-async def get_stuck_shipments(
+async def get_shipments(
     days_stuck: int = 5, 
     lookback_days: int = 30, 
     page: int = 1,          # Added parameter for Claude
@@ -1605,13 +1605,13 @@ async def get_stuck_shipments(
     stuck_shipments.sort(key=lambda x: x[1], reverse=True)
 
     # Format the header to include page and limit info for Claude
-    summary = f"⚠️ FOUND {len(stuck_shipments)} STUCK SHIPMENTS (> {days_stuck} days without update)\n"
-    summary += f"📅 Date Range: {min_date_str} to {max_date_str}\n"
-    summary += f"📄 Page: {page} | Limit: {limit} | Fetched: {len(shipments)} items\n"
+    summary = f"FOUND {len(stuck_shipments)} STUCK SHIPMENTS (> {days_stuck} days without update)\n"
+    summary += f"Date Range: {min_date_str} to {max_date_str}\n"
+    summary += f"Page: {page} | Limit: {limit} | Fetched: {len(shipments)} items\n"
     
     # Give Claude a clear hint if there might be more data
     if len(shipments) == limit:
-        summary += f"💡 Note: There are likely more shipments. Call this tool again with page={page + 1} to continue searching.\n"
+        summary += f"Note: There are likely more shipments. Call this tool again with page={page + 1} to continue searching.\n"
         
     summary += f"{'-' * 60}\n\n"
 
@@ -1631,10 +1631,10 @@ async def get_stuck_shipments(
         if sub_status:
             display_status += f" ({sub_status})"
 
-        summary += f"📦 Order: {order_id} | AWB: {awb}\n"
-        summary += f"   Carrier: {carrier}\n"
-        summary += f"   Status: {display_status}\n"
-        summary += f"   Last Update: {latest_date} ({days} days ago)\n\n"
+        summary += f"Order: {order_id} | AWB: {awb}\n"
+        summary += f"Carrier: {carrier}\n"
+        summary += f"Status: {display_status}\n"
+        summary += f"Last Update: {latest_date} ({days} days ago)\n\n"
 
     return summary
 
