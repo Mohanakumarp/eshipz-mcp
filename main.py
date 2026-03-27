@@ -1,12 +1,12 @@
 import json
 from typing import Any
+import uuid
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from dotenv import load_dotenv
 import os
 import re
-from datetime import datetime 
 from auth import EshipzOAuthProvider
 from datetime import datetime, timezone, timedelta
 # Load environment variables
@@ -41,6 +41,11 @@ ESHIPZ_API_CREATE_SHIPMENT_URL = os.getenv("ESHIPZ_API_CREATE_SHIPMENT_URL")
 ESHIPZ_API_DOCKET_ALLOCATION_URL =os.getenv("ESHIPZ_API_DOCKET_ALLOCATION_URL")
 ESHIPZ_API_ORDERS_URL = os.getenv("ESHIPZ_API_ORDERS_URL")
 ESHIPZ_API_GET_SHIPMENTS_URL = os.getenv("ESHIPZ_API_GET_SHIPMENTS_URL") # e.g., "https://xxxxxxxxxxxxxxx/xxx/xxx/xxxxxxxxxx"
+
+SHIPMENT_QUERY_TTL_SECONDS = int(os.getenv("SHIPMENT_QUERY_TTL_SECONDS", "1200"))
+SHIPMENT_QUERY_MAX_CONTEXTS = int(os.getenv("SHIPMENT_QUERY_MAX_CONTEXTS", "25"))
+SHIPMENT_QUERY_MAX_RECORDS = int(os.getenv("SHIPMENT_QUERY_MAX_RECORDS", "2000"))
+_SHIPMENT_QUERY_CACHE: dict[str, dict[str, Any]] = {}
 
 
 def _resolve_eshipz_token(ctx: Context | None = None) -> str:
@@ -1547,6 +1552,426 @@ async def fetch_shipments_page(
             
     return []
 
+
+def _parse_checkpoint_date(date_str: str | None) -> datetime | None:
+    if not date_str:
+        return None
+
+    accepted_formats = [
+        "%a, %d %b %Y %H:%M:%S GMT",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+    ]
+
+    for fmt in accepted_formats:
+        try:
+            parsed = datetime.strptime(date_str, fmt)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except ValueError:
+            continue
+
+    try:
+        parsed = datetime.fromisoformat(str(date_str).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _normalize_shipment_record(shipment: dict[str, Any], now_utc: datetime) -> dict[str, Any]:
+    status = str(shipment.get("tracking_status", "") or "")
+    sub_status = str(shipment.get("tracking_sub_status", "") or "")
+    checkpoint_raw = shipment.get("latest_checkpoint_date")
+    checkpoint_dt = _parse_checkpoint_date(checkpoint_raw)
+    days_since_update = None
+
+    if checkpoint_dt is not None:
+        days_since_update = max((now_utc - checkpoint_dt).days, 0)
+
+    return {
+        "awb": shipment.get("awb", ""),
+        "order_id": shipment.get("order_id", ""),
+        "tracking_status": status,
+        "tracking_sub_status": sub_status,
+        "carrier": shipment.get("vendor_display_name", shipment.get("slug", "Unknown")),
+        "slug": shipment.get("slug", ""),
+        "latest_checkpoint_date": checkpoint_raw,
+        "days_since_update": days_since_update,
+        "raw": shipment,
+    }
+
+
+def _normalize_shipments(shipments: list[dict[str, Any]], now_utc: datetime) -> list[dict[str, Any]]:
+    return [_normalize_shipment_record(shipment, now_utc) for shipment in shipments]
+
+
+def _filter_shipment_records(
+    records: list[dict[str, Any]],
+    status: str = "",
+    sub_status: str = "",
+    carrier: str = "",
+    awb: str = "",
+    order_id: str = "",
+    min_days_without_update: int | None = None,
+    max_days_without_update: int | None = None,
+    include_delivered: bool = True,
+) -> list[dict[str, Any]]:
+    status_norm = status.strip().lower()
+    sub_status_norm = sub_status.strip().lower()
+    carrier_norm = carrier.strip().lower()
+    awb_norm = awb.strip().lower()
+    order_id_norm = order_id.strip().lower()
+
+    filtered: list[dict[str, Any]] = []
+
+    for record in records:
+        record_status = str(record.get("tracking_status", "") or "")
+        record_sub_status = str(record.get("tracking_sub_status", "") or "")
+        record_carrier = str(record.get("carrier", "") or "")
+        record_awb = str(record.get("awb", "") or "")
+        record_order = str(record.get("order_id", "") or "")
+        days_since_update = record.get("days_since_update")
+
+        if not include_delivered and (record_status == "Delivered" or record_sub_status == "RTODelivered"):
+            continue
+
+        if status_norm and record_status.lower() != status_norm:
+            continue
+
+        if sub_status_norm and record_sub_status.lower() != sub_status_norm:
+            continue
+
+        if carrier_norm and carrier_norm not in record_carrier.lower():
+            continue
+
+        if awb_norm and awb_norm not in record_awb.lower():
+            continue
+
+        if order_id_norm and order_id_norm not in record_order.lower():
+            continue
+
+        if min_days_without_update is not None:
+            if days_since_update is None or days_since_update < min_days_without_update:
+                continue
+
+        if max_days_without_update is not None:
+            if days_since_update is None or days_since_update > max_days_without_update:
+                continue
+
+        filtered.append(record)
+
+    return filtered
+
+
+def _calculate_stuck_shipments(
+    records: list[dict[str, Any]],
+    days_stuck: int,
+    include_delivered: bool = False,
+) -> list[dict[str, Any]]:
+    return _filter_shipment_records(
+        records,
+        min_days_without_update=days_stuck + 1,
+        include_delivered=include_delivered,
+    )
+
+
+def _bucket_from_days(days_since_update: int | None) -> str:
+    if days_since_update is None:
+        return "unknown"
+    if days_since_update <= 1:
+        return "0-1 days"
+    if days_since_update <= 3:
+        return "2-3 days"
+    if days_since_update <= 7:
+        return "4-7 days"
+    return "8+ days"
+
+
+def _aggregate_shipment_records(records: list[dict[str, Any]], group_by: str = "status") -> dict[str, int]:
+    aggregation: dict[str, int] = {}
+
+    for record in records:
+        if group_by == "carrier":
+            key = str(record.get("carrier", "Unknown") or "Unknown")
+        elif group_by == "sub_status":
+            key = str(record.get("tracking_sub_status", "") or "Unknown")
+        elif group_by == "age_bucket":
+            key = _bucket_from_days(record.get("days_since_update"))
+        else:
+            key = str(record.get("tracking_status", "") or "Unknown")
+
+        aggregation[key] = aggregation.get(key, 0) + 1
+
+    return dict(sorted(aggregation.items(), key=lambda item: (-item[1], item[0])))
+
+
+def _cleanup_expired_query_contexts() -> None:
+    now = datetime.now(timezone.utc)
+    expired_keys = [
+        cache_key
+        for cache_key, payload in _SHIPMENT_QUERY_CACHE.items()
+        if payload.get("expires_at") and payload["expires_at"] <= now
+    ]
+
+    for cache_key in expired_keys:
+        _SHIPMENT_QUERY_CACHE.pop(cache_key, None)
+
+
+def _create_query_context(records: list[dict[str, Any]], meta: dict[str, Any]) -> str:
+    _cleanup_expired_query_contexts()
+
+    if len(_SHIPMENT_QUERY_CACHE) >= SHIPMENT_QUERY_MAX_CONTEXTS:
+        oldest_key = min(
+            _SHIPMENT_QUERY_CACHE,
+            key=lambda cache_key: _SHIPMENT_QUERY_CACHE[cache_key].get("created_at", datetime.now(timezone.utc)),
+        )
+        _SHIPMENT_QUERY_CACHE.pop(oldest_key, None)
+
+    clipped_records = records[:SHIPMENT_QUERY_MAX_RECORDS]
+    now = datetime.now(timezone.utc)
+    context_id = str(uuid.uuid4())
+
+    _SHIPMENT_QUERY_CACHE[context_id] = {
+        "created_at": now,
+        "expires_at": now + timedelta(seconds=SHIPMENT_QUERY_TTL_SECONDS),
+        "meta": meta,
+        "records": clipped_records,
+    }
+
+    return context_id
+
+
+def _get_query_context(query_id: str) -> dict[str, Any] | None:
+    _cleanup_expired_query_contexts()
+    context = _SHIPMENT_QUERY_CACHE.get(query_id)
+    if context is None:
+        return None
+
+    if context.get("expires_at") and context["expires_at"] <= datetime.now(timezone.utc):
+        _SHIPMENT_QUERY_CACHE.pop(query_id, None)
+        return None
+
+    return context
+
+
+def _paginate_records(records: list[dict[str, Any]], page: int, limit: int) -> list[dict[str, Any]]:
+    safe_page = max(page, 1)
+    safe_limit = max(limit, 1)
+    start = (safe_page - 1) * safe_limit
+    end = start + safe_limit
+    return records[start:end]
+
+
+def _resolve_min_max_dates(lookback_days: int, min_date: str = "", max_date: str = "") -> tuple[str, str]:
+    if min_date and max_date:
+        return min_date, max_date
+
+    now_utc = datetime.now(timezone.utc)
+    min_date_obj = now_utc - timedelta(days=lookback_days)
+    return min_date_obj.strftime("%Y-%m-%d"), now_utc.strftime("%Y-%m-%d")
+
+
+@mcp.tool()
+async def query_shipments(
+    lookback_days: int = 30,
+    page: int = 1,
+    limit: int = 50,
+    min_date: str = "",
+    max_date: str = "",
+    status: str = "",
+    sub_status: str = "",
+    carrier: str = "",
+    awb: str = "",
+    order_id: str = "",
+    include_delivered: bool = True,
+    ctx: Context = None,
+) -> str:
+    """
+    Fetches shipments and stores the normalized result as a reusable query context.
+    Returns a query_id that can be used for follow-up analysis tools.
+    """
+    api_token = _resolve_eshipz_token(ctx)
+
+    if not ESHIPZ_API_GET_SHIPMENTS_URL:
+        return "Error: ESHIPZ_API_GET_SHIPMENTS_URL is not defined in the environment variables."
+
+    min_date_str, max_date_str = _resolve_min_max_dates(lookback_days, min_date, max_date)
+    shipments = await fetch_shipments_page(min_date_str, max_date_str, page, limit, api_token)
+    now_utc = datetime.now(timezone.utc)
+    normalized = _normalize_shipments(shipments, now_utc)
+    filtered = _filter_shipment_records(
+        normalized,
+        status=status,
+        sub_status=sub_status,
+        carrier=carrier,
+        awb=awb,
+        order_id=order_id,
+        include_delivered=include_delivered,
+    )
+
+    query_meta = {
+        "filters": {
+            "status": status,
+            "sub_status": sub_status,
+            "carrier": carrier,
+            "awb": awb,
+            "order_id": order_id,
+            "include_delivered": include_delivered,
+        },
+        "lookback_days": lookback_days,
+        "min_date": min_date_str,
+        "max_date": max_date_str,
+        "fetched_count": len(shipments),
+        "filtered_count": len(filtered),
+        "source_page": page,
+        "source_limit": limit,
+    }
+    query_id = _create_query_context(filtered, query_meta)
+
+    response = {
+        "query_id": query_id,
+        "cache_ttl_seconds": SHIPMENT_QUERY_TTL_SECONDS,
+        "summary": {
+            "min_date": min_date_str,
+            "max_date": max_date_str,
+            "page": page,
+            "limit": limit,
+            "fetched_count": len(shipments),
+            "filtered_count": len(filtered),
+            "has_more_in_source": len(shipments) == limit,
+        },
+        "records": filtered,
+        "next_step_hint": "Use query_shipments_followup with this query_id for stuck checks, filters, aggregation, and drilldowns.",
+    }
+
+    return json.dumps(response, default=str)
+
+
+@mcp.tool()
+async def query_shipments_followup(
+    query_id: str,
+    intent: str = "list",
+    group_by: str = "status",
+    status: str = "",
+    sub_status: str = "",
+    carrier: str = "",
+    awb: str = "",
+    order_id: str = "",
+    min_days_without_update: int = -1,
+    max_days_without_update: int = -1,
+    days_stuck: int = 5,
+    page: int = 1,
+    limit: int = 50,
+) -> str:
+    """
+    Performs follow-up queries on cached shipment records from query_shipments using query_id.
+    intent: list | aggregate | stuck
+    """
+    context = _get_query_context(query_id)
+    if context is None:
+        return "Error: query_id not found or expired. Run query_shipments again to create a fresh query context."
+
+    base_records = context.get("records", [])
+    min_days_value = None if min_days_without_update < 0 else min_days_without_update
+    max_days_value = None if max_days_without_update < 0 else max_days_without_update
+    filtered = _filter_shipment_records(
+        base_records,
+        status=status,
+        sub_status=sub_status,
+        carrier=carrier,
+        awb=awb,
+        order_id=order_id,
+        min_days_without_update=min_days_value,
+        max_days_without_update=max_days_value,
+        include_delivered=True,
+    )
+
+    normalized_intent = intent.strip().lower()
+    if normalized_intent == "stuck":
+        stuck = _calculate_stuck_shipments(filtered, days_stuck, include_delivered=False)
+        stuck_sorted = sorted(
+            stuck,
+            key=lambda record: record.get("days_since_update", -1),
+            reverse=True,
+        )
+        paged = _paginate_records(stuck_sorted, page, limit)
+        response = {
+            "query_id": query_id,
+            "intent": "stuck",
+            "days_stuck": days_stuck,
+            "total_matches": len(stuck_sorted),
+            "page": page,
+            "limit": limit,
+            "records": paged,
+        }
+        return json.dumps(response, default=str)
+
+    if normalized_intent == "aggregate":
+        safe_group_by = group_by if group_by in {"status", "carrier", "sub_status", "age_bucket"} else "status"
+        aggregated = _aggregate_shipment_records(filtered, group_by=safe_group_by)
+        response = {
+            "query_id": query_id,
+            "intent": "aggregate",
+            "group_by": safe_group_by,
+            "total_records_considered": len(filtered),
+            "aggregation": aggregated,
+        }
+        return json.dumps(response, default=str)
+
+    sorted_records = sorted(
+        filtered,
+        key=lambda record: record.get("days_since_update", -1),
+        reverse=True,
+    )
+    paged = _paginate_records(sorted_records, page, limit)
+    response = {
+        "query_id": query_id,
+        "intent": "list",
+        "total_matches": len(sorted_records),
+        "page": page,
+        "limit": limit,
+        "records": paged,
+    }
+    return json.dumps(response, default=str)
+
+
+@mcp.tool()
+async def get_shipment_details_from_query(
+    query_id: str,
+    awb: str = "",
+    order_id: str = "",
+) -> str:
+    """
+    Returns one shipment detail record from a cached query context using AWB or order ID.
+    """
+    context = _get_query_context(query_id)
+    if context is None:
+        return "Error: query_id not found or expired. Run query_shipments again to create a fresh query context."
+
+    awb_norm = awb.strip().lower()
+    order_norm = order_id.strip().lower()
+    if not awb_norm and not order_norm:
+        return "Error: Provide either awb or order_id to fetch shipment details from query context."
+
+    for record in context.get("records", []):
+        record_awb = str(record.get("awb", "") or "").lower()
+        record_order = str(record.get("order_id", "") or "").lower()
+
+        if (awb_norm and awb_norm == record_awb) or (order_norm and order_norm == record_order):
+            return json.dumps(
+                {
+                    "query_id": query_id,
+                    "shipment": record,
+                },
+                default=str,
+            )
+
+    return "No shipment found in this query context for the provided awb/order_id."
+
 @mcp.tool()
 async def get_shipments(
     days_stuck: int = 5, 
@@ -1578,36 +2003,38 @@ async def get_shipments(
     if not shipments:
         return f"No shipments found on page {page} between {min_date_str} and {max_date_str}."
 
-    stuck_shipments = []
+    normalized = _normalize_shipments(shipments, now_utc)
+    stuck_records = _calculate_stuck_shipments(normalized, days_stuck, include_delivered=False)
+    stuck_shipments = sorted(
+        [
+            (record.get("raw", {}), record.get("days_since_update", 0))
+            for record in stuck_records
+        ],
+        key=lambda item: item[1],
+        reverse=True,
+    )
 
-    for shipment in shipments:
-        status = shipment.get("tracking_status", "")
-        sub_status = shipment.get("tracking_sub_status", "")
-        
-        if status == "Delivered" or sub_status == "RTODelivered":
-            continue
-
-        date_str = shipment.get("latest_checkpoint_date")
-        if not date_str:
-            continue
-
-        try:
-            checkpoint_date = datetime.strptime(date_str, "%a, %d %b %Y %H:%M:%S GMT")
-            checkpoint_date = checkpoint_date.replace(tzinfo=timezone.utc)
-            
-            days_diff = (now_utc - checkpoint_date).days
-            
-            if days_diff > days_stuck:
-                stuck_shipments.append((shipment, days_diff))
-        except ValueError:
-            continue
-
-    stuck_shipments.sort(key=lambda x: x[1], reverse=True)
+    query_id = _create_query_context(
+        normalized,
+        {
+            "filters": {
+                "stuck_days": days_stuck,
+            },
+            "lookback_days": lookback_days,
+            "min_date": min_date_str,
+            "max_date": max_date_str,
+            "fetched_count": len(shipments),
+            "source_page": page,
+            "source_limit": limit,
+            "source_tool": "get_shipments",
+        },
+    )
 
     # Format the header to include page and limit info for Claude
     summary = f"FOUND {len(stuck_shipments)} STUCK SHIPMENTS (> {days_stuck} days without update)\n"
     summary += f"Date Range: {min_date_str} to {max_date_str}\n"
     summary += f"Page: {page} | Limit: {limit} | Fetched: {len(shipments)} items\n"
+    summary += f"Query ID: {query_id} (use query_shipments_followup / get_shipment_details_from_query for additional queries)\n"
     
     # Give Claude a clear hint if there might be more data
     if len(shipments) == limit:

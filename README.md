@@ -75,6 +75,33 @@ After configuring the server and restarting Claude Desktop, you can ask Claude t
 
 Note: for the required fields for all features refer to the API docs of eShipz
 
+### Shipment Query Workflow (Reusable Response Data)
+
+The server now supports a fetch-once, query-many flow for shipment analysis.
+
+1. Run `query_shipments` to fetch shipments and create a reusable `query_id` context.
+2. Reuse the same `query_id` with `query_shipments_followup` for:
+- stuck shipment checks (`intent="stuck"`)
+- grouped summaries (`intent="aggregate"`, `group_by="status"|"carrier"|"sub_status"|"age_bucket"`)
+- filtered listing (`intent="list"` with optional filters)
+3. Use `get_shipment_details_from_query` to fetch a specific shipment from cached context by `awb` or `order_id`.
+
+This lets Claude answer multiple follow-up questions from the same API response without refetching each time.
+
+### Backward Compatibility
+
+- `get_shipments` still works for stuck shipment reporting.
+- It now internally uses shared shipment normalization/stuck logic and includes a `Query ID` in output for follow-up analysis.
+
+### Query Context Behavior
+
+- Query contexts are short-lived in-memory cache entries.
+- If a query id expires, rerun `query_shipments` to get a fresh `query_id`.
+- Cache tuning environment variables:
+- `SHIPMENT_QUERY_TTL_SECONDS` (default: `1200`)
+- `SHIPMENT_QUERY_MAX_CONTEXTS` (default: `25`)
+- `SHIPMENT_QUERY_MAX_RECORDS` (default: `2000`)
+
 ## Development
 
 Run the server locally for testing:
